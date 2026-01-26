@@ -2,14 +2,19 @@
 """
 Feed Discovery Module for awesome-rss-feeds integration
 Parses OPML files and provides searchable feed database
+with advanced health monitoring and quality scoring
 """
 
 import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import json
 import logging
+import requests
+import feedparser
+from datetime import datetime, timedelta
+import hashlib
 
 logger = logging.getLogger(__name__)
 
@@ -326,6 +331,472 @@ class FeedDiscovery:
             "by_type": by_type,
             "available": True
         }
+
+    def check_feed_health(self, feed_url: str, timeout: int = 10) -> Dict[str, Any]:
+        """Check feed health and availability"""
+        try:
+            response = requests.get(feed_url, timeout=timeout)
+            if response.status_code == 200:
+                # Parse feed to check validity
+                feed = feedparser.parse(response.content)
+                if feed.bozo and feed.bozo_exception:
+                    return {
+                        "status": "unhealthy",
+                        "last_check": datetime.utcnow().isoformat(),
+                        "error": f"Feed parsing error: {feed.bozo_exception}",
+                        "status_code": response.status_code,
+                        "item_count": 0
+                    }
+                
+                item_count = len(feed.entries)
+                return {
+                    "status": "healthy",
+                    "last_check": datetime.utcnow().isoformat(),
+                    "item_count": item_count,
+                    "status_code": response.status_code,
+                    "error": None
+                }
+            else:
+                return {
+                    "status": "unhealthy",
+                    "last_check": datetime.utcnow().isoformat(),
+                    "error": f"HTTP {response.status_code}",
+                    "status_code": response.status_code,
+                    "item_count": 0
+                }
+        except requests.exceptions.Timeout:
+            return {
+                "status": "unhealthy",
+                "last_check": datetime.utcnow().isoformat(),
+                "error": "Timeout",
+                "status_code": None,
+                "item_count": 0
+            }
+        except requests.exceptions.RequestException as e:
+            return {
+                "status": "unhealthy",
+                "last_check": datetime.utcnow().isoformat(),
+                "error": str(e),
+                "status_code": None,
+                "item_count": 0
+            }
+        except Exception as e:
+            return {
+                "status": "unhealthy",
+                "last_check": datetime.utcnow().isoformat(),
+                "error": f"Unexpected error: {str(e)}",
+                "status_code": None,
+                "item_count": 0
+            }
+
+    def calculate_feed_score(self, feed_url: str, timeout: int = 10) -> float:
+        """Calculate feed quality score (0-100)"""
+        health = self.check_feed_health(feed_url, timeout)
+        
+        if health["status"] != "healthy":
+            return 0.0
+        
+        score = 100.0
+        
+        # Deduct for errors
+        if health.get("error"):
+            score -= 50
+        
+        # Deduct for low item count
+        item_count = health.get("item_count", 0)
+        if item_count < 5:
+            score -= 20
+        elif item_count < 10:
+            score -= 10
+        
+        # Deduct for HTTP errors (non-200 status)
+        status_code = health.get("status_code")
+        if status_code and status_code != 200:
+            score -= 30
+        
+        return max(0.0, min(100.0, score))
+
+    def batch_check_feeds(self, feed_urls: List[str], timeout: int = 10) -> List[Dict[str, Any]]:
+        """Check health of multiple feeds"""
+        results = []
+        for url in feed_urls:
+            health = self.check_feed_health(url, timeout)
+            score = self.calculate_feed_score(url, timeout)
+            results.append({
+                "url": url,
+                "health": health,
+                "score": score
+            })
+        return results
+
+    def get_feed_categories(self, feed_url: str) -> List[str]:
+        """Get categories for a specific feed based on URL and title"""
+        categories = []
+        
+        # Search through all cached feeds to find this URL
+        for category_key, category_data in self.feeds_cache.items():
+            for feed in category_data.get("feeds", []):
+                if feed.get("url") == feed_url:
+                    # Found the feed, extract its category
+                    if "category" in category_data:
+                        categories.append(category_data["category"])
+                    break
+        
+        return categories
+
+    def add_custom_feed(self, feed_url: str, title: str, description: str = "", category: str = "custom") -> bool:
+        """Add a custom feed to the database"""
+        try:
+            # Create a simple OPML structure for custom feeds
+            custom_feeds_path = self.awesome_feeds_path / "custom"
+            custom_feeds_path.mkdir(exist_ok=True)
+            
+            opml_file = custom_feeds_path / f"{category}.opml"
+            
+            # Read existing content if file exists
+            existing_feeds = []
+            if opml_file.exists():
+                existing_feeds = self._parse_opml_file(opml_file)
+            
+            # Check if feed already exists
+            for existing_feed in existing_feeds:
+                if existing_feed.get("url") == feed_url:
+                    return False
+            
+            # Add new feed
+            new_feed = {
+                "title": title,
+                "text": title,
+                "description": description,
+                "url": feed_url,
+                "type": "rss"
+            }
+            existing_feeds.append(new_feed)
+            
+            # Write back to OPML file
+            self._write_opml_file(opml_file, existing_feeds, category)
+            
+            # Reload cache
+            self._load_all_feeds()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error adding custom feed: {e}")
+            return False
+
+    def remove_custom_feed(self, feed_url: str, category: str = "custom") -> bool:
+        """Remove a custom feed from the database"""
+        try:
+            custom_feeds_path = self.awesome_feeds_path / "custom"
+            opml_file = custom_feeds_path / f"{category}.opml"
+            
+            if not opml_file.exists():
+                return False
+            
+            # Read existing feeds
+            existing_feeds = self._parse_opml_file(opml_file)
+            
+            # Remove the feed
+            filtered_feeds = [feed for feed in existing_feeds if feed.get("url") != feed_url]
+            
+            if len(filtered_feeds) == len(existing_feeds):
+                return False  # Feed not found
+            
+            # Write back to OPML file
+            self._write_opml_file(opml_file, filtered_feeds, category)
+            
+            # Reload cache
+            self._load_all_feeds()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error removing custom feed: {e}")
+            return False
+
+    def export_feeds(self, format: str = "opml", category: str = None) -> str:
+        """Export feeds in specified format"""
+        try:
+            if format == "opml":
+                return self._export_opml(category)
+            elif format == "json":
+                return self._export_json(category)
+            elif format == "csv":
+                return self._export_csv(category)
+            else:
+                raise ValueError(f"Unsupported format: {format}")
+        except Exception as e:
+            logger.error(f"Error exporting feeds: {e}")
+            raise
+
+    def import_feeds(self, content: str, format: str = "opml", category: str = "imported") -> Dict[str, Any]:
+        """Import feeds from specified format"""
+        try:
+            if format == "opml":
+                return self._import_opml(content, category)
+            elif format == "json":
+                return self._import_json(content, category)
+            elif format == "csv":
+                return self._import_csv(content, category)
+            else:
+                raise ValueError(f"Unsupported format: {format}")
+        except Exception as e:
+            logger.error(f"Error importing feeds: {e}")
+            raise
+
+    def _write_opml_file(self, file_path: Path, feeds: List[Dict[str, Any]], category: str):
+        """Write feeds to OPML file"""
+        opml_content = '<?xml version="1.0" encoding="UTF-8"?>\n'
+        opml_content += '<opml version="2.0">\n'
+        opml_content += f'  <head>\n'
+        opml_content += f'    <title>{category}</title>\n'
+        opml_content += f'  </head>\n'
+        opml_content += '  <body>\n'
+        
+        for feed in feeds:
+            opml_content += f'    <outline text="{feed.get("text", "")}" title="{feed.get("title", "")}" description="{feed.get("description", "")}" xmlUrl="{feed.get("url", "")}" type="{feed.get("type", "rss")}"/>\n'
+        
+        opml_content += '  </body>\n'
+        opml_content += '</opml>\n'
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(opml_content)
+
+    def _export_opml(self, category: str = None) -> str:
+        """Export feeds as OPML"""
+        opml_content = '<?xml version="1.0" encoding="UTF-8"?>\n'
+        opml_content += '<opml version="2.0">\n'
+        opml_content += '  <head>\n'
+        opml_content += '    <title>News02 Feeds Export</title>\n'
+        opml_content += '  </head>\n'
+        opml_content += '  <body>\n'
+        
+        categories_to_export = []
+        if category:
+            if category in self.feeds_cache:
+                categories_to_export = [category]
+        else:
+            categories_to_export = list(self.feeds_cache.keys())
+        
+        for category_key in categories_to_export:
+            category_data = self.feeds_cache.get(category_key, {})
+            feeds = category_data.get("feeds", [])
+            
+            if feeds:
+                opml_content += f'    <outline text="{category_data.get("display_name", category_key)}">\n'
+                for feed in feeds:
+                    opml_content += f'      <outline text="{feed.get("text", "")}" title="{feed.get("title", "")}" description="{feed.get("description", "")}" xmlUrl="{feed.get("url", "")}" type="{feed.get("type", "rss")}"/>\n'
+                opml_content += '    </outline>\n'
+        
+        opml_content += '  </body>\n'
+        opml_content += '</opml>\n'
+        
+        return opml_content
+
+    def _export_json(self, category: str = None) -> str:
+        """Export feeds as JSON"""
+        export_data = {
+            "export_date": datetime.utcnow().isoformat(),
+            "version": "1.0",
+            "feeds": []
+        }
+        
+        categories_to_export = []
+        if category:
+            if category in self.feeds_cache:
+                categories_to_export = [category]
+        else:
+            categories_to_export = list(self.feeds_cache.keys())
+        
+        for category_key in categories_to_export:
+            category_data = self.feeds_cache.get(category_key, {})
+            feeds = category_data.get("feeds", [])
+            
+            for feed in feeds:
+                export_data["feeds"].append({
+                    "url": feed.get("url"),
+                    "title": feed.get("title"),
+                    "description": feed.get("description"),
+                    "category": category_data.get("display_name", category_key),
+                    "type": feed.get("type", "rss")
+                })
+        
+        return json.dumps(export_data, indent=2)
+
+    def _export_csv(self, category: str = None) -> str:
+        """Export feeds as CSV"""
+        import csv
+        import io
+        
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["URL", "Title", "Description", "Category", "Type"])
+        
+        categories_to_export = []
+        if category:
+            if category in self.feeds_cache:
+                categories_to_export = [category]
+        else:
+            categories_to_export = list(self.feeds_cache.keys())
+        
+        for category_key in categories_to_export:
+            category_data = self.feeds_cache.get(category_key, {})
+            feeds = category_data.get("feeds", [])
+            
+            for feed in feeds:
+                writer.writerow([
+                    feed.get("url", ""),
+                    feed.get("title", ""),
+                    feed.get("description", ""),
+                    category_data.get("display_name", category_key),
+                    feed.get("type", "rss")
+                ])
+        
+        return output.getvalue()
+
+    def _import_opml(self, content: str, category: str) -> Dict[str, Any]:
+        """Import feeds from OPML"""
+        try:
+            # Parse OPML content
+            root = ET.fromstring(content)
+            feeds = []
+            
+            # Find all outline elements with xmlUrl
+            for outline in root.findall(".//outline[@xmlUrl]"):
+                feed_info = {
+                    "title": outline.get("title", "").strip(),
+                    "text": outline.get("text", "").strip(),
+                    "description": outline.get("description", "").strip(),
+                    "url": outline.get("xmlUrl", "").strip(),
+                    "type": outline.get("type", "rss").strip()
+                }
+                
+                if feed_info["url"] and feed_info["title"]:
+                    feeds.append(feed_info)
+            
+            # Save to custom category
+            custom_feeds_path = self.awesome_feeds_path / "custom"
+            custom_feeds_path.mkdir(exist_ok=True)
+            
+            opml_file = custom_feeds_path / f"{category}.opml"
+            self._write_opml_file(opml_file, feeds, category)
+            
+            # Reload cache
+            self._load_all_feeds()
+            
+            return {
+                "success": True,
+                "imported_count": len(feeds),
+                "category": category
+            }
+            
+        except ET.ParseError as e:
+            return {
+                "success": False,
+                "error": f"XML parsing error: {str(e)}",
+                "imported_count": 0
+            }
+
+    def _import_json(self, content: str, category: str) -> Dict[str, Any]:
+        """Import feeds from JSON"""
+        try:
+            data = json.loads(content)
+            feeds = []
+            
+            if "feeds" in data:
+                for feed_data in data["feeds"]:
+                    feed_info = {
+                        "title": feed_data.get("title", ""),
+                        "text": feed_data.get("title", ""),
+                        "description": feed_data.get("description", ""),
+                        "url": feed_data.get("url", ""),
+                        "type": feed_data.get("type", "rss")
+                    }
+                    
+                    if feed_info["url"] and feed_info["title"]:
+                        feeds.append(feed_info)
+            
+            # Save to custom category
+            custom_feeds_path = self.awesome_feeds_path / "custom"
+            custom_feeds_path.mkdir(exist_ok=True)
+            
+            opml_file = custom_feeds_path / f"{category}.opml"
+            self._write_opml_file(opml_file, feeds, category)
+            
+            # Reload cache
+            self._load_all_feeds()
+            
+            return {
+                "success": True,
+                "imported_count": len(feeds),
+                "category": category
+            }
+            
+        except json.JSONDecodeError as e:
+            return {
+                "success": False,
+                "error": f"JSON parsing error: {str(e)}",
+                "imported_count": 0
+            }
+
+    def _import_csv(self, content: str, category: str) -> Dict[str, Any]:
+        """Import feeds from CSV"""
+        try:
+            import csv
+            import io
+            
+            reader = csv.reader(io.StringIO(content))
+            header = next(reader, None)
+            
+            if not header:
+                return {
+                    "success": False,
+                    "error": "Empty CSV file",
+                    "imported_count": 0
+                }
+            
+            # Find column indices
+            url_idx = header.index("URL") if "URL" in header else 0
+            title_idx = header.index("Title") if "Title" in header else 1
+            desc_idx = header.index("Description") if "Description" in header else 2
+            
+            feeds = []
+            for row in reader:
+                if len(row) > url_idx:
+                    feed_info = {
+                        "title": row[title_idx] if len(row) > title_idx else "",
+                        "text": row[title_idx] if len(row) > title_idx else "",
+                        "description": row[desc_idx] if len(row) > desc_idx else "",
+                        "url": row[url_idx],
+                        "type": "rss"
+                    }
+                    
+                    if feed_info["url"] and feed_info["title"]:
+                        feeds.append(feed_info)
+            
+            # Save to custom category
+            custom_feeds_path = self.awesome_feeds_path / "custom"
+            custom_feeds_path.mkdir(exist_ok=True)
+            
+            opml_file = custom_feeds_path / f"{category}.opml"
+            self._write_opml_file(opml_file, feeds, category)
+            
+            # Reload cache
+            self._load_all_feeds()
+            
+            return {
+                "success": True,
+                "imported_count": len(feeds),
+                "category": category
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"CSV parsing error: {str(e)}",
+                "imported_count": 0
+            }
 
 
 # Global instance

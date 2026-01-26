@@ -2,7 +2,7 @@ import os
 import yaml
 import logging
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Union
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -10,6 +10,7 @@ load_dotenv()
 
 @dataclass
 class ModelConfig:
+    """Configuration for a specific LLM model"""
     api_endpoint: str
     api_key: str
     model: str
@@ -18,15 +19,17 @@ class ModelConfig:
     top_p: Optional[float] = None
 
 class ConfigManager:
-    def __init__(self):
-        self.llm_provider = os.getenv('LLM_PROVIDER', 'ollama')
-        self.models_config = self.load_model_configs()
+    """Manages configuration for News02 application"""
+    
+    def __init__(self) -> None:
+        self.llm_provider: str = os.getenv('LLM_PROVIDER', 'ollama')
+        self.models_config: Dict[str, ModelConfig] = self.load_model_configs()
         self.setup_logging()
         
-    def setup_logging(self):
+    def setup_logging(self) -> None:
         """Setup logging configuration"""
-        log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
-        log_dir = os.getenv('LOG_DIR', 'logs')
+        log_level: str = os.getenv('LOG_LEVEL', 'INFO').upper()
+        log_dir: str = os.getenv('LOG_DIR', 'logs')
         
         # Create logs directory if it doesn't exist
         os.makedirs(log_dir, exist_ok=True)
@@ -41,8 +44,16 @@ class ConfigManager:
         )
         
     def load_model_configs(self) -> Dict[str, ModelConfig]:
-        """Load model configurations from YAML file"""
-        config_path = os.getenv('AI_MODELS_CONFIG', 'settings/llm_settings/ai_models.yml')
+        """Load model configurations from YAML file
+        
+        Returns:
+            Dictionary mapping model names to their configurations
+            
+        Raises:
+            FileNotFoundError: If configuration file doesn't exist
+            yaml.YAMLError: If YAML parsing fails
+        """
+        config_path: str = os.getenv('AI_MODELS_CONFIG', 'settings/llm_settings/ai_models.yml')
         
         try:
             with open(config_path, 'r') as file:
@@ -54,7 +65,7 @@ class ConfigManager:
             logging.error(f"Error parsing YAML configuration: {e}")
             raise
         
-        configs = {}
+        configs: Dict[str, ModelConfig] = {}
         for name, config in config_data.items():
             try:
                 configs[name] = ModelConfig(**config)
@@ -65,7 +76,17 @@ class ConfigManager:
         return configs
     
     def get_model_config(self, model_name: str) -> ModelConfig:
-        """Get specific model configuration with environment variable overrides"""
+        """Get specific model configuration with environment variable overrides
+        
+        Args:
+            model_name: Name of the model configuration to retrieve
+            
+        Returns:
+            ModelConfig object with environment variable overrides applied
+            
+        Raises:
+            ValueError: If model configuration doesn't exist
+        """
         if model_name not in self.models_config:
             raise ValueError(f"Model configuration '{model_name}' not found")
         
@@ -84,27 +105,43 @@ class ConfigManager:
         return config
     
     def get_database_config(self) -> Dict[str, Any]:
-        """Get database configuration"""
+        """Get database configuration
+        
+        Returns:
+            Dictionary with database configuration
+        """
         return {
             'enabled': os.getenv('DATABASE_ENABLED', 'true').lower() == 'true',
             'path': os.getenv('DATABASE_PATH', 'data/news.db')
         }
     
     def get_output_config(self) -> Dict[str, Any]:
-        """Get output configuration"""
+        """Get output configuration
+        
+        Returns:
+            Dictionary with output configuration
+        """
         return {
             'directory': os.getenv('OUTPUT_DIRECTORY', './output'),
             'max_articles_per_feed': int(os.getenv('MAX_ARTICLES_PER_FEED', '1'))
         }
     
     def get_tts_config(self) -> Dict[str, str]:
-        """Get TTS configuration"""
+        """Get TTS configuration
+        
+        Returns:
+            Dictionary with TTS configuration
+        """
         return {
             'voice': os.getenv('TTS_VOICE', 'en-US-GuyNeural')
         }
     
     def get_feeds_config_path(self) -> str:
-        """Get feeds configuration file path"""
+        """Get feeds configuration file path
+        
+        Returns:
+            Path to feeds configuration file
+        """
         return os.getenv('FEEDS_CONFIG_PATH', 'settings/feeds/feeds.yaml')
 
 # Global configuration instance

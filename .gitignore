@@ -126,3 +126,4 @@ api_keys.txt
 # Temporary files
 .DS_Store
 Thumbs.db
+.env

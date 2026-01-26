@@ -1,0 +1,89 @@
+version: '3.8'
+
+services:
+  news02:
+    build: .
+    container_name: news02
+    ports:
+      - "5000:5000"  # Web interface
+      - "7855:7855"  # API server
+    environment:
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai_compatible}
+      - OPENAI_API_BASE=${OPENAI_API_BASE:-http://host.docker.internal:8000/v1}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-sk-12345}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - DATABASE_ENABLED=${DATABASE_ENABLED:-true}
+      - DATABASE_PATH=/app/data/news02.db
+      - MAX_ARTICLES_PER_FEED=${MAX_ARTICLES_PER_FEED:-1}
+      - TTS_VOICE=${TTS_VOICE:-en-US-GuyNeural}
+      - FLASK_SECRET_KEY=${FLASK_SECRET_KEY:-news02-secret-key-change-me}
+    volumes:
+      - ./data:/app/data
+      - ./output:/app/output
+      - ./settings:/app/settings
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - news02-network
+
+  # Optional: Redis for caching (uncomment if needed)
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: news02-redis
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis-data:/data
+  #   restart: unless-stopped
+  #   networks:
+  #     - news02-network
+
+  # Optional: Prometheus for monitoring (uncomment if needed)
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   container_name: news02-prometheus
+  #   ports:
+  #     - "9090:9090"
+  #   volumes:
+  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml
+  #     - prometheus-data:/prometheus
+  #   command:
+  #     - '--config.file=/etc/prometheus/prometheus.yml'
+  #     - '--storage.tsdb.path=/prometheus'
+  #     - '--web.console.libraries=/etc/prometheus/console_libraries'
+  #     - '--web.console.templates=/etc/prometheus/consoles'
+  #     - '--storage.tsdb.retention.time=200h'
+  #     - '--web.enable-lifecycle'
+  #   restart: unless-stopped
+  #   networks:
+  #     - news02-network
+
+  # Optional: Grafana for visualization (uncomment if needed)
+  # grafana:
+  #   image: grafana/grafana:latest
+  #   container_name: news02-grafana
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - GF_SECURITY_ADMIN_PASSWORD=admin
+  #   volumes:
+  #     - grafana-data:/var/lib/grafana
+  #   restart: unless-stopped
+  #   networks:
+  #     - news02-network
+
+networks:
+  news02-network:
+    driver: bridge
+
+# volumes:
+#   redis-data:
+#   prometheus-data:
+#   grafana-data:

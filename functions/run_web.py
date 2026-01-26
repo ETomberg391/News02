@@ -11,6 +11,10 @@ import webbrowser
 import time
 import threading
 
+# Add the root directory to Python path to make 'functions' package accessible
+# This is needed when running from the root directory
+sys.path.insert(0, os.getcwd())
+
 def check_dependencies():
     """Check if all required dependencies are installed"""
     print("🔍 Checking dependencies...")
@@ -106,7 +110,7 @@ def main():
     
     # Start Flask app
     try:
-        from web_app import app
+        from functions.web_server import app
         app.run(host=host, port=port, debug=debug)
     except KeyboardInterrupt:
         print("\n👋 Web server stopped")

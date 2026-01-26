@@ -14,12 +14,20 @@ import edge_tts
 import logging
 from tqdm import tqdm
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
+from functions.exceptions import (
+    FeedError, DigestGenerationError, LLMError,
+    DatabaseError, ValidationError
+)
 
 # Import custom modules
 from functions.config_manager import config_manager, ModelConfig
 from functions.llm_client import LLMFactory, retry_with_backoff
 from functions.database import NewsDatabase
+
+# Async imports
+import aiohttp
+import aiohttp.client_exceptions
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -29,8 +37,18 @@ llm_client = LLMFactory.create_client(config_manager.llm_provider)
 db_config = config_manager.get_database_config()
 database = NewsDatabase(db_config['path']) if db_config['enabled'] else None
 
-def load_feeds(config_path: str = None) -> List[str]:
-    """Load feed URLs from YAML configuration"""
+def load_feeds(config_path: Optional[str] = None) -> List[str]:
+    """Load feed URLs from YAML configuration
+    
+    Args:
+        config_path: Path to feeds configuration file
+        
+    Returns:
+        List of RSS feed URLs
+        
+    Raises:
+        FeedError: If configuration file doesn't exist or YAML parsing fails
+    """
     if config_path is None:
         config_path = config_manager.get_feeds_config_path()
     
@@ -42,13 +60,21 @@ def load_feeds(config_path: str = None) -> List[str]:
         return feeds
     except FileNotFoundError:
         logger.error(f"Feed configuration file not found: {config_path}")
-        raise
+        raise FeedError(f"Feed configuration file not found: {config_path}")
     except yaml.YAMLError as e:
         logger.error(f"Error parsing feed configuration: {e}")
-        raise
+        raise FeedError(f"Error parsing feed configuration: {str(e)}")
 
-def fetch_articles(feed_urls: List[str], max_articles: int = None) -> List[Dict[str, Any]]:
-    """Fetch and parse articles from RSS feeds with database integration"""
+def fetch_articles(feed_urls: List[str], max_articles: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Fetch and parse articles from RSS feeds with database integration
+    
+    Args:
+        feed_urls: List of RSS feed URLs to fetch from
+        max_articles: Maximum articles per feed (uses config if None)
+        
+    Returns:
+        List of article dictionaries with title, link, published, and source_feed
+    """
     if max_articles is None:
         output_config = config_manager.get_output_config()
         max_articles = output_config['max_articles_per_feed']
@@ -92,9 +118,98 @@ def fetch_articles(feed_urls: List[str], max_articles: int = None) -> List[Dict[
     logger.info(f"Total new articles found: {len(articles)}")
     return articles
 
+
+async def fetch_articles_async(feed_urls: List[str], max_articles: Optional[int] = None, max_concurrent: int = 10) -> List[Dict[str, Any]]:
+    """Fetch and parse articles from RSS feeds asynchronously with database integration
+    
+    Args:
+        feed_urls: List of RSS feed URLs to fetch from
+        max_articles: Maximum articles per feed (uses config if None)
+        max_concurrent: Maximum number of concurrent requests
+        
+    Returns:
+        List of article dictionaries with title, link, published, and source_feed
+    """
+    if max_articles is None:
+        output_config = config_manager.get_output_config()
+        max_articles = output_config['max_articles_per_feed']
+    
+    articles = []
+    logger.info(f"Fetching articles from {len(feed_urls)} feeds asynchronously...")
+    
+    # Create semaphore to limit concurrent requests
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def fetch_single_feed(session: aiohttp.ClientSession, url: str) -> List[Dict[str, Any]]:
+        """Fetch a single feed asynchronously"""
+        async with semaphore:
+            try:
+                # Use aiohttp for async HTTP requests
+                async with session.get(url, timeout=30) as response:
+                    if response.status != 200:
+                        logger.warning(f"Feed {url} returned status {response.status}")
+                        if database:
+                            database.update_feed_stats(url, success=False)
+                        return []
+                    
+                    content = await response.text()
+                    feed = feedparser.parse(content)
+                    
+                    if feed.bozo and feed.bozo_exception:
+                        logger.warning(f"Feed parsing issue for {url}: {feed.bozo_exception}")
+                    
+                    feed_articles = []
+                    for entry in feed.entries[:max_articles]:
+                        # Skip if article already exists in database
+                        if database and database.article_exists(entry.link):
+                            continue
+                        
+                        feed_articles.append({
+                            'title': entry.title,
+                            'link': entry.link,
+                            'published': entry.get('published', 'N/A'),
+                            'source_feed': url
+                        })
+                    
+                    # Update feed statistics
+                    if database:
+                        database.update_feed_stats(url, success=True)
+                    
+                    logger.debug(f"Fetched {len(feed_articles)} new articles from {url}")
+                    return feed_articles
+                    
+            except Exception as e:
+                logger.error(f"Error fetching feed {url}: {e}")
+                if database:
+                    database.update_feed_stats(url, success=False)
+                return []
+    
+    # Create aiohttp session and fetch all feeds concurrently
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_single_feed(session, url) for url in feed_urls]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Combine all results
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Error in async feed fetch: {result}")
+            elif result:
+                articles.extend(result)
+    
+    logger.info(f"Total new articles found: {len(articles)}")
+    return articles
+
 @retry_with_backoff(max_retries=3)
-def summarize_with_llm(text: str, model_config_name: str = None) -> str:
-    """Summarize article using configured LLM provider"""
+def summarize_with_llm(text: str, model_config_name: Optional[str] = None) -> Tuple[str, int]:
+    """Summarize article using configured LLM provider
+    
+    Args:
+        text: Article text to summarize
+        model_config_name: Name of model configuration to use
+        
+    Returns:
+        Tuple of (summary text, processing time in milliseconds)
+    """
     if model_config_name is None:
         model_config_name = os.getenv('SUMMARY_MODEL_CONFIG', 'default_model')
     
@@ -123,9 +238,17 @@ def summarize_with_llm(text: str, model_config_name: str = None) -> str:
     logger.debug(f"Generated summary in {processing_time}ms using {model_config.model}")
     return result, processing_time
 
-def extract_and_summarize_articles(articles: List[Dict[str, Any]], 
-                                 model_config_name: str = None) -> List[Dict[str, Any]]:
-    """Extract and summarize article content with database storage"""
+def extract_and_summarize_articles(articles: List[Dict[str, Any]],
+                                 model_config_name: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Extract and summarize article content with database storage
+    
+    Args:
+        articles: List of article dictionaries
+        model_config_name: Name of model configuration to use
+        
+    Returns:
+        List of summary dictionaries with title, link, published, summary, and source_feed
+    """
     summaries = []
     logger.info(f"Processing {len(articles)} articles...")
     
@@ -173,9 +296,17 @@ def extract_and_summarize_articles(articles: List[Dict[str, Any]],
     return summaries
 
 @retry_with_backoff(max_retries=3)
-def generate_broadcast_with_llm(summaries: List[Dict[str, Any]], 
-                               model_config_name: str = None) -> str:
-    """Generate news broadcast using configured LLM provider"""
+def generate_broadcast_with_llm(summaries: List[Dict[str, Any]],
+                               model_config_name: Optional[str] = None) -> str:
+    """Generate news broadcast using configured LLM provider
+    
+    Args:
+        summaries: List of summary dictionaries
+        model_config_name: Name of model configuration to use
+        
+    Returns:
+        Generated broadcast text
+    """
     if model_config_name is None:
         model_config_name = os.getenv('BROADCAST_MODEL_CONFIG', 'broadcast_model')
     
@@ -226,8 +357,18 @@ def generate_broadcast_with_llm(summaries: List[Dict[str, Any]],
     logger.info(f"Generated broadcast in {processing_time}ms using {model_config.model}")
     return result
 
-def save_digest(digest_text: str, output_dir: str = None, summaries: List[Dict[str, Any]] = None, job_name: str = None) -> str:
-    """Save full broadcast with timestamped filename and source metadata"""
+def save_digest(digest_text: str, output_dir: Optional[str] = None, summaries: Optional[List[Dict[str, Any]]] = None, job_name: Optional[str] = None) -> str:
+    """Save full broadcast with timestamped filename and source metadata
+    
+    Args:
+        digest_text: Generated broadcast text
+        output_dir: Output directory path
+        summaries: List of summary dictionaries for source metadata
+        job_name: Job name for filename
+        
+    Returns:
+        Path to saved digest file
+    """
     if output_dir is None:
         output_config = config_manager.get_output_config()
         output_dir = output_config['directory']
@@ -296,7 +437,14 @@ Models Used:
     return filename
 
 def clean_text_for_tts(text: str) -> str:
-    """Clean broadcast text for natural TTS by removing stage directions and formatting"""
+    """Clean broadcast text for natural TTS by removing stage directions and formatting
+    
+    Args:
+        text: Raw broadcast text
+        
+    Returns:
+        Cleaned text suitable for TTS
+    """
     lines = text.split('\n')
     cleaned_lines = []
     
@@ -331,8 +479,14 @@ def clean_text_for_tts(text: str) -> str:
     logger.debug(f"Cleaned text for TTS: {len(text)} chars -> {len(cleaned_text)} chars")
     return cleaned_text
 
-async def text_to_speech(text: str, output_path: str, voice: str = None) -> None:
-    """Convert broadcast to speech with timestamped filename"""
+async def text_to_speech(text: str, output_path: str, voice: Optional[str] = None) -> None:
+    """Convert broadcast to speech with timestamped filename
+    
+    Args:
+        text: Text to convert to speech
+        output_path: Path to save audio file
+        voice: TTS voice to use (uses config if None)
+    """
     if voice is None:
         tts_config = config_manager.get_tts_config()
         voice = tts_config['voice']
@@ -346,9 +500,9 @@ async def text_to_speech(text: str, output_path: str, voice: str = None) -> None
         logger.info(f"Generated TTS audio: {output_path}")
     except Exception as e:
         logger.error(f"Error generating TTS: {e}")
-        raise
+        raise DigestGenerationError(f"Error generating TTS: {str(e)}") from e
 
-def print_analytics():
+def print_analytics() -> None:
     """Print feed analytics if database is enabled"""
     if not database:
         return
@@ -362,7 +516,7 @@ def print_analytics():
     except Exception as e:
         logger.error(f"Error getting analytics: {e}")
 
-async def main():
+async def main() -> None:
     """Enhanced main workflow with multi-provider LLM support"""
     try:
         logger.info("Starting News Digest Generation...")
@@ -407,17 +561,116 @@ async def main():
         
     except Exception as e:
         logger.error(f"Error in main workflow: {e}")
-        raise
+        raise DigestGenerationError(f"Error in main workflow: {str(e)}") from e
 
 # Backward compatibility functions
-def summarize_with_ollama(text, model=None):
-    """Legacy function for backward compatibility"""
+def summarize_with_ollama(text: str, model: Optional[str] = None) -> str:
+    """Legacy function for backward compatibility
+    
+    Args:
+        text: Article text to summarize
+        model: Model name (ignored, kept for compatibility)
+        
+    Returns:
+        Summary text
+    """
     summary, _ = summarize_with_llm(text, 'default_model')
     return summary
 
-def generate_broadcast(summaries, model=None):
-    """Legacy function for backward compatibility"""
+def generate_broadcast(summaries: List[Dict[str, Any]], model: Optional[str] = None) -> str:
+    """Legacy function for backward compatibility
+    
+    Args:
+        summaries: List of summary dictionaries
+        model: Model name (ignored, kept for compatibility)
+        
+    Returns:
+        Generated broadcast text
+    """
     return generate_broadcast_with_llm(summaries, 'broadcast_model')
+
+class NewsDigestEnhanced:
+    """Main class for news digest generation with enhanced features"""
+    
+    def __init__(self) -> None:
+        """Initialize the news digest generator"""
+        self.llm_client = llm_client
+        self.database = database
+        logger.info("NewsDigestEnhanced initialized")
+    
+    async def generate_digest(self, feed_urls: Optional[List[str]] = None,
+                           output_dir: Optional[str] = None,
+                           job_name: Optional[str] = None) -> Tuple[str, Optional[str]]:
+        """Generate a complete news digest
+        
+        Args:
+            feed_urls: List of RSS feed URLs (uses config if None)
+            output_dir: Output directory path (uses config if None)
+            job_name: Job name for filename
+            
+        Returns:
+            Tuple of (digest_path, mp3_path)
+        """
+        try:
+            # Load RSS feeds if not provided
+            if feed_urls is None:
+                feed_urls = load_feeds()
+            
+            # Fetch articles with deduplication
+            articles = fetch_articles(feed_urls)
+            
+            if not articles:
+                logger.info("No new articles to process")
+                print_analytics()
+                return None, None
+            
+            # Process articles
+            summaries = extract_and_summarize_articles(articles)
+            
+            if not summaries:
+                logger.warning("No articles successfully processed")
+                return None, None
+            
+            # Generate broadcast
+            broadcast = generate_broadcast_with_llm(summaries)
+            
+            # Save outputs
+            digest_path = save_digest(broadcast, output_dir=output_dir, summaries=summaries, job_name=job_name)
+            
+            # Generate TTS audio
+            mp3_path = digest_path.replace('.md', '.mp3')
+            await text_to_speech(broadcast, output_path=mp3_path)
+            
+            # Store broadcast in database
+            if self.database:
+                broadcast_model = os.getenv('BROADCAST_MODEL_CONFIG', 'broadcast_model')
+                self.database.store_broadcast(broadcast, broadcast_model, len(summaries),
+                                           digest_path, mp3_path)
+            
+            logger.info("News digest generation completed successfully!")
+            print_analytics()
+            
+            return digest_path, mp3_path
+            
+        except Exception as e:
+            logger.error(f"Error in digest generation: {e}")
+            raise DigestGenerationError(f"Error in digest generation: {str(e)}") from e
+    
+    def get_analytics(self) -> Optional[List[Dict[str, Any]]]:
+        """Get feed analytics
+        
+        Returns:
+            List of feed analytics data or None if database disabled
+        """
+        if not self.database:
+            return None
+        
+        try:
+            return self.database.get_feed_analytics()
+        except Exception as e:
+            logger.error(f"Error getting analytics: {e}")
+            return None
+
 
 if __name__ == "__main__":
     asyncio.run(main())
